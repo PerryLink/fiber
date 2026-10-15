@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"slices"
 	"sort"
 	"time"
 
@@ -34,7 +35,7 @@ type Config struct {
 	//   - Request path (bounded to 192 bytes, hashed if longer)
 	//   - Canonical query string (sorted parameters, bounded)
 	//   - Selected request headers (from KeyHeaders)
-	//   - Selected cookies (from KeyCookies)
+	//   - Selected cookies (from KeyCookies, their values hashed)
 	//
 	// The resulting cache key is always partitioned by request method internally.
 	//
@@ -73,8 +74,24 @@ type Config struct {
 	// KeyCookies is an explicit allow-list of request cookies that should partition cache entries.
 	// Cookies are excluded by default to avoid accidental per-user cache fragmentation.
 	//
+	// Values are hashed in the key, so an external Storage does not show them. A missing
+	// and an empty cookie share a key.
+	//
 	// Optional. Default: nil
 	KeyCookies []string
+
+	// KeyCredentialHeaders names request headers that carry a client's credential, such
+	// as a token in a header of your own. They partition entries like KeyHeaders, their
+	// values are hashed in the key, hits keyed on them are private and never served
+	// stale, and a refusal (401, 403 or 407) ends all of the credential's entries.
+	//
+	// Authorization, and Cookie, Proxy-Authorization, X-API-Key, X-Auth-Token and
+	// X-Access-Token when KeyHeaders names them, always count. With a custom
+	// KeyGenerator they take no part in the key, but a hit for a request that sends one
+	// stays private and is never served stale.
+	//
+	// Optional. Default: nil
+	KeyCredentialHeaders []string
 
 	// Methods specifies which HTTP methods are eligible for caching.
 	// Requests with methods not in this list bypass the cache entirely.
@@ -83,6 +100,12 @@ type Config struct {
 	//
 	// Default: []string{fiber.MethodGet, fiber.MethodHead}
 	Methods []string
+
+	// credentialKeyHeaders is the part of KeyHeaders that carries a credential.
+	credentialKeyHeaders []string
+
+	// refusalRecordLimit overrides the refusal record limit in tests; zero derives it from MaxBytes.
+	refusalRecordLimit int
 
 	// Expiration is the time that a cached response will live
 	//
@@ -95,6 +118,10 @@ type Config struct {
 	//
 	// Optional. Default: 1 * 1024 * 1024
 	MaxBytes uint
+
+	// spellCookies keys KeyCookies values in full, as the previous key version did; only
+	// legacyPurge's copy sets it.
+	spellCookies bool
 
 	// DisableQueryKeys disables query-string partitioning in cache keys.
 	//
@@ -115,8 +142,9 @@ type Config struct {
 	//
 	// When false, a hit whose entry carries no Cache-Control of its own is sent
 	// with "public, max-age=<remaining>", or "private, max-age=<remaining>" when
-	// the entry holds one user's response: the response's Vary lists Cookie or
-	// Authorization, KeyCookies is set, or KeyHeaders names either header.
+	// the entry holds one user's response: the response's Vary lists a header that
+	// carries a credential, KeyCookies or KeyCredentialHeaders is set, or KeyHeaders
+	// names such a header (see KeyCredentialHeaders).
 	//
 	// Optional. Default: false
 	DisableCacheControl bool
@@ -146,6 +174,7 @@ var ConfigDefault = Config{
 	DisableQueryKeys:      false,
 	KeyHeaders:            []string{fiber.HeaderAccept, fiber.HeaderAcceptEncoding, fiber.HeaderAcceptLanguage},
 	KeyCookies:            nil,
+	KeyCredentialHeaders:  nil,
 	Methods:               []string{fiber.MethodGet, fiber.MethodHead},
 	DisableVaryHeaders:    false,
 	ExpirationGenerator:   nil,
@@ -159,8 +188,7 @@ func configDefault(config ...Config) Config {
 	// Return default config if nothing provided
 	if len(config) < 1 {
 		cfg := ConfigDefault
-		cfg.KeyHeaders = normalizeHeaderDimensions(cfg.KeyHeaders, ConfigDefault.KeyHeaders)
-		cfg.KeyCookies = normalizeCookieDimensions(cfg.KeyCookies, nil)
+		cfg.normalizeKeys()
 		if cfg.KeyGenerator == nil {
 			cfg.usesDefaultKeyGenerator = true
 			cfg.KeyGenerator = func(c fiber.Ctx) string {
@@ -183,8 +211,7 @@ func configDefault(config ...Config) Config {
 	if cfg.CacheHeader == "" {
 		cfg.CacheHeader = ConfigDefault.CacheHeader
 	}
-	cfg.KeyHeaders = normalizeHeaderDimensions(cfg.KeyHeaders, ConfigDefault.KeyHeaders)
-	cfg.KeyCookies = normalizeCookieDimensions(cfg.KeyCookies, nil)
+	cfg.normalizeKeys()
 	// nil = use default methods; explicit empty slice = cache no methods
 	if cfg.Methods == nil {
 		cfg.Methods = ConfigDefault.Methods
@@ -209,6 +236,17 @@ func configDefault(config ...Config) Config {
 		cfg.usesDefaultKeyGenerator = false
 	}
 	return cfg
+}
+
+// normalizeKeys normalizes the key's dimensions and works out which headers carry a credential.
+func (cfg *Config) normalizeKeys() {
+	cfg.KeyCredentialHeaders = normalizeHeaderDimensions(cfg.KeyCredentialHeaders, nil)
+	cfg.KeyHeaders = normalizeHeaderDimensions(slices.Concat(
+		normalizeHeaderDimensions(cfg.KeyHeaders, ConfigDefault.KeyHeaders),
+		cfg.KeyCredentialHeaders,
+	), nil)
+	cfg.credentialKeyHeaders = cfg.appendCredentials(nil, cfg.KeyHeaders)
+	cfg.KeyCookies = normalizeCookieDimensions(cfg.KeyCookies, nil)
 }
 
 // now returns the current time used for freshness decisions. Production uses
